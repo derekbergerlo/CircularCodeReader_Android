@@ -8,7 +8,7 @@ import 'package:image_picker/image_picker.dart';
 import 'decoder/bit_ring_decoder.dart';
 import 'services/api_client.dart';
 
-import 'widgets/camera_overlay.dart';
+import 'widgets/live_scanner_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -171,25 +171,21 @@ class _HomePageState extends State<HomePage> {
                   label: const Text('Galería'),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _busy
-                      ? null
-                      : () async {
-                          await Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => Scaffold(
-                                appBar: AppBar(title: const Text("Escanear código circular")),
-                                body: CameraWithOverlay(
-                                  onImageCaptured: (bytes) async {
-                                    Navigator.of(context).pop(); // volvemos al Home
-                                    await _process(bytes);      // procesamos la imagen
-                                  },
-                                ),
-                              ),
-                            ),
-                          );
+                  onPressed: () async {
+                    await Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => LiveScannerScreen(
+                        onResult: ({required productBits, required dateBits, required imageBytes}) {
+                          setState(() {
+                            _bitsProductoLocal = productBits;
+                            _bitsFechaLocal = dateBits;
+                            _imageBytes = imageBytes;
+                          });
                         },
+                      ),
+                    ));
+                  },
                   icon: const Icon(Icons.center_focus_strong),
-                  label: const Text("Escanear cámara"),
+                  label: const Text('Escaneo profesional'),
                 ),
               ],
             ),
