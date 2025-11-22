@@ -1,0 +1,33 @@
+workflows:
+  android_release:
+    name: Android APK Build
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      vars:
+        GRADLE_OPTS: "-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError"
+      java: 17
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "main"
+          include: true
+          source: true
+    scripts:
+      - name: Get Flutter packages
+        script: |
+          flutter pub get
+
+      - name: Set gradle memory options
+        script: |
+          echo "org.gradle.jvmargs=-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8" >> android/gradle.properties
+          echo "android.useAndroidX=true" >> android/gradle.properties
+          echo "android.enableJetifier=true" >> android/gradle.properties
+
+      - name: Build APK (debug)
+        script: |
+          flutter build apk --debug
+
+    artifacts:
+      - build/app/outputs/flutter-apk/app-debug.apk
