@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 
 import '../decoder/bit_ring_decoder.dart';
+import '../decoder/auto_radial.dart';
 
 typedef OnScanResult = void Function({
   required List<int> productBits,
@@ -99,17 +100,60 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
 
     // Create payload for isolate
     final payload = _CameraFramePayload.fromCameraImage(image, _controller!.description.sensorOrientation);
-    compute<_CameraFramePayload, _ScanCandidate>(_analyzeFrameIsolate, payload).then((candidate) {
+    compute<_CameraFramePayload, _ScanCandidate>(_analyzeFrameIsolate, payload).then((candidate) async {
       _isProcessing = false;
       if (!mounted || !_scanningActive) return;
 
-      if (candidate.confidence > 0.45) {
+      if (candidate != null && candidate.confidence > 0.45) {
         _lastConfidence = candidate.confidence;
         _consecutiveDetections++;
         _progress = min(1.0, _consecutiveDetections / widget.requiredDetections);
         setState(() {});
+
         if (_consecutiveDetections >= widget.requiredDetections && widget.autoCapture) {
-          _performHighResCapture();
+          // Try fast preview decode if thumbnail available
+          bool usedPreview = false;
+          if (candidate.thumbnail != null) {
+            try {
+              final thumbImg = img.decodeImage(candidate.thumbnail!);
+              if (thumbImg != null) {
+                final dec = CircularCodeDecoder(thumbImg);
+                final scale = min(thumbImg.width, thumbImg.height) / 2;
+                final rInt1 = scale * 0.2;
+                final rInt2 = scale * 0.5;
+                final rExt1 = scale * 0.55;
+                final rExt2 = scale * 0.85;
+
+                final inicioProducto = dec.detectarInicio(r1: rExt1, r2: rExt2, desplazamientoRelativo: 0.2);
+                final inicioFecha = dec.detectarInicio(r1: rInt1, r2: rInt2, desplazamientoRelativo: 0.4);
+
+                final bitsProducto = dec.bitsDesdeIndice(
+                  dec.extractBits(r1: rExt1, r2: rExt2, colorType: 'negro', desplazamientoRelativo: 0.2),
+                  inicioProducto,
+                );
+                final bitsFecha = dec.bitsDesdeIndice(
+                  dec.extractBits(r1: rInt1, r2: rInt2, colorType: 'amarillo', desplazamientoRelativo: 0.4),
+                  inicioFecha,
+                );
+
+                final onesProd = bitsProducto.where((b) => b==1).length;
+                final onesDate = bitsFecha.where((b) => b==1).length;
+
+                // simple plausibility checks: not all ones/zeros and some ones
+                if (onesProd > 0 && onesProd < bitsProducto.length && onesDate >= 0 && onesDate <= bitsFecha.length) {
+                  // accept preview result
+                  widget.onResult(productBits: bitsProducto, dateBits: bitsFecha, imageBytes: candidate.thumbnail!);
+                  usedPreview = true;
+                }
+              }
+            } catch (e) {
+              debugPrint('Preview decode error: $e');
+            }
+          }
+
+          if (!usedPreview) {
+            await _performHighResCapture();
+          }
         }
       } else {
         // decay
@@ -134,23 +178,31 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
       final decoded = img.decodeImage(bytes);
       if (decoded == null) throw Exception('No se pudo decodificar la imagen capturada.');
 
+      // Auto-calculate radial params on the captured image
+      final params = autoCalcularRadios(decoded, decoded.width ~/ 2, decoded.height ~/ 2, steps: 180);
       final decoder = CircularCodeDecoder(decoded);
-      final scale = min(decoded.width, decoded.height) / 2;
-      final rInt1 = scale * 0.2;
-      final rInt2 = scale * 0.5;
-      final rExt1 = scale * 0.55;
-      final rExt2 = scale * 0.85;
 
-      final inicioProducto = decoder.detectarInicio(r1: rExt1, r2: rExt2, desplazamientoRelativo: 0.2);
-      final inicioFecha = decoder.detectarInicio(r1: rInt1, r2: rInt2, desplazamientoRelativo: 0.4);
+      final rExt1 = params.rInner;
+      final rExt2 = params.rOuter;
+      final desplRel = params.relPos;
+
+      final inicioProducto = decoder.detectarInicio(r1: rExt1, r2: rExt2, desplazamientoRelativo: desplRel);
+
+      // For inner ring use proportional inner radii relative to detected outer ring
+      // We'll estimate inner ring by scaling inward (~0.45 of outer radius)
+      final centerScale = min(decoded.width, decoded.height)/2;
+      final rInt2 = rExt1 * 0.9; // estimate inner outer boundary relative to outer ring
+      final rInt1 = rInt2 * 0.45; // estimate inner inner boundary
+
+      final inicioFecha = decoder.detectarInicio(r1: rInt1, r2: rInt2, desplazamientoRelativo: 0.5);
 
       final bitsProducto = decoder.bitsDesdeIndice(
-        decoder.extractBits(r1: rExt1, r2: rExt2, colorType: 'negro', desplazamientoRelativo: 0.2),
+        decoder.extractBits(r1: rExt1, r2: rExt2, colorType: 'negro', desplazamientoRelativo: desplRel),
         inicioProducto,
       );
 
       final bitsFecha = decoder.bitsDesdeIndice(
-        decoder.extractBits(r1: rInt1, r2: rInt2, colorType: 'amarillo', desplazamientoRelativo: 0.4),
+        decoder.extractBits(r1: rInt1, r2: rInt2, colorType: 'amarillo', desplazamientoRelativo: 0.5),
         inicioFecha,
       );
 
@@ -285,14 +337,17 @@ class _CameraFramePayload {
   }
 }
 
+
 class _ScanCandidate {
   final double confidence;
   final int centerX;
   final int centerY;
-  _ScanCandidate({required this.confidence, required this.centerX, required this.centerY});
+  final Uint8List? thumbnail; // small jpeg/png for quick preview decoding
+
+  _ScanCandidate({required this.confidence, required this.centerX, required this.centerY, this.thumbnail});
 }
 
-/// Runs in an isolate: converts YUV -> RGB (fast), then does radial edge detection
+/// Runs in an isolate/// Runs in an isolate: converts YUV -> RGB (fast), then does radial edge detection
 Future<_ScanCandidate> _analyzeFrameIsolate(_CameraFramePayload payload) async {
   try {
     final width = payload.width;
@@ -372,9 +427,25 @@ Future<_ScanCandidate> _analyzeFrameIsolate(_CameraFramePayload payload) async {
 
     final confidence = edgePoints.length / steps;
 
-    return _ScanCandidate(confidence: confidence.clamp(0.0, 1.0), centerX: avgX.round(), centerY: avgY.round());
+    
+    // encode thumbnail (jpeg) from imgSmall for quick preview decode
+    Uint8List? thumbBytes;
+    try {
+      final jpg = img.encodeJpg(imgSmall, quality: 75);
+      thumbBytes = Uint8List.fromList(jpg);
+    } catch (e) {
+      thumbBytes = null;
+    }
+
+    return _ScanCandidate(
+      confidence: confidence.clamp(0.0, 1.0),
+      centerX: avgX.round(),
+      centerY: avgY.round(),
+      thumbnail: thumbBytes,
+    );
+
   } catch (e, st) {
     debugPrint('analyze isolate error: $e\n$st');
-    return _ScanCandidate(confidence: 0.0, centerX: (payload.width / 2).round(), centerY: (payload.height / 2).round());
+    return _ScanCandidate(confidence: 0.0, centerX: (payload.width / 2).round(), centerY: (payload.height / 2).round(), thumbnail: null);
   }
 }
