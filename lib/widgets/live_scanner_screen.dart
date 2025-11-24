@@ -9,7 +9,7 @@ import 'package:image/image.dart' as img;
 
 import '../decoder/bit_ring_decoder.dart';
 import '../decoder/auto_radial.dart';
-
+z
 typedef OnScanResult = void Function({
   required List<int> productBits,
   required List<int> dateBits,
@@ -35,6 +35,15 @@ class LiveScannerScreen extends StatefulWidget {
 }
 
 class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindingObserver {
+  // DEBUG overlay vars (always active)
+  double? _debugRInner;
+  double? _debugROuter;
+  int? _debugCenterX;
+  int? _debugCenterY;
+  int? _debugImageW;
+  int? _debugImageH;
+  bool _debugAlwaysOn = true;
+  
   CameraController? _controller;
   CameraDescription? _camera;
   bool _isProcessing = false;
@@ -107,6 +116,11 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
       if (candidate != null && candidate.confidence > 0.45) {
         _lastConfidence = candidate.confidence;
         _consecutiveDetections++;
+        // store detected center for overlay
+        try {
+          _debugCenterX = candidate.centerX;
+          _debugCenterY = candidate.centerY;
+        } catch (e) {}
         _progress = min(1.0, _consecutiveDetections / widget.requiredDetections);
         setState(() {});
 
@@ -152,7 +166,11 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
           }
 
           if (!usedPreview) {
-            await _performHighResCapture();
+            if ((_debugRInner != null && _debugROuter != null) || _lastConfidence > 0.95) {
+              _performHighResCapture();
+            } else {
+              debugPrint('Capture postponed: radii not set or confidence insufficient');
+            }
           }
         }
       } else {
@@ -178,13 +196,22 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
       final decoded = img.decodeImage(bytes);
       if (decoded == null) throw Exception('No se pudo decodificar la imagen capturada.');
 
-      // Auto-calculate radial params on the captured image
-      final params = autoCalcularRadios(decoded, decoded.width ~/ 2, decoded.height ~/ 2, steps: 180);
-      final decoder = CircularCodeDecoder(decoded);
+      // auto-calculate radial params for accurate sampling (v2)
+      try {
+        final params = autoCalcularRadios(decoded, decoded.width ~/ 2, decoded.height ~/ 2, steps: 180);
+        _debugRInner = params.rInner;
+        _debugROuter = params.rOuter;
+        _debugImageW = decoded.width;
+        _debugImageH = decoded.height;
+        debugPrint('Auto radial: inner=${_debugRInner}, outer=${_debugROuter}');
+      } catch (e) {
+        debugPrint('autoCalcularRadios failed: $e');
+      }
 
-      final rExt1 = params.rInner;
-      final rExt2 = params.rOuter;
-      final desplRel = params.relPos;
+
+      final rExt1 = _debugRInner ?? (scale * 0.55);
+      final rExt2 = _debugROuter ?? (scale * 0.85);
+      final desplRel = 0.65; // o params.relPos if you saved it
 
       final inicioProducto = decoder.detectarInicio(r1: rExt1, r2: rExt2, desplazamientoRelativo: desplRel);
 
@@ -278,7 +305,16 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
           shape: BoxShape.circle,
           border: Border.all(color: Colors.white70, width: 4),
         ),
-        child: CustomPaint(painter: _OverlayPainter()),
+        child: CustomPaint(
+          painter: _OverlayPainter(
+            debugCenterX: _debugCenterX,
+            debugCenterY: _debugCenterY,
+            debugRInner: _debugRInner,
+            debugROuter: _debugROuter,
+            debugImageW: _debugImageW,
+            debugImageH: _debugImageH,
+          ),
+        ),
       ),
     );
   }
@@ -286,6 +322,22 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
 
 /// Painter for the overlay reticle
 class _OverlayPainter extends CustomPainter {
+  final int? debugCenterX;
+  final int? debugCenterY;
+  final double? debugRInner;
+  final double? debugROuter;
+  final int? debugImageW;
+  final int? debugImageH;
+
+  _OverlayPainter({
+    this.debugCenterX,
+    this.debugCenterY,
+    this.debugRInner,
+    this.debugROuter,
+    this.debugImageW,
+    this.debugImageH,
+  });
+
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
@@ -296,19 +348,41 @@ class _OverlayPainter extends CustomPainter {
       ..color = Colors.white38;
     canvas.drawCircle(center, radius - 4, paint);
 
-    final markPaint = Paint()
-      ..color = Colors.white70
-      ..strokeWidth = 1.4;
+    final markPaint = Paint()..color = Colors.white70..strokeWidth = 1.4;
     for (int i = 0; i < 16; i++) {
       final ang = 2 * pi * i / 16;
       final p1 = center + Offset(cos(ang), sin(ang)) * (radius - 6);
       final p2 = center + Offset(cos(ang), sin(ang)) * (radius - 20);
       canvas.drawLine(p1, p2, markPaint);
     }
+
+    // debug center
+    if (debugCenterX != null && debugCenterY != null) {
+      final dotPaint = Paint()..color = Colors.redAccent..style = PaintingStyle.fill;
+      canvas.drawCircle(center, 4, dotPaint);
+    }
+
+    // draw debug radii if available and map image pixels to preview overlay
+    if (debugRInner != null && debugROuter != null && debugImageW != null && debugImageH != null) {
+      final circlePaint = Paint()..style = PaintingStyle.stroke..strokeWidth = 2;
+      final imgMin = min(debugImageW!.toDouble(), debugImageH!.toDouble());
+      final previewRadius = min(size.width, size.height) / 2.0;
+      final imgRadius = imgMin / 2.0;
+      final scaleFactor = previewRadius / imgRadius;
+      final innerR = (debugRInner! * scaleFactor).clamp(2.0, previewRadius);
+      final outerR = (debugROuter! * scaleFactor).clamp(2.0, previewRadius);
+
+      canvas.drawCircle(center, innerR, circlePaint..color = Colors.limeAccent);
+      canvas.drawCircle(center, outerR, circlePaint..color = Colors.orangeAccent);
+    } else if (debugRInner != null && debugROuter != null) {
+      // fallback approximate
+      canvas.drawCircle(center, radius * 0.6, Paint()..style = PaintingStyle.stroke..strokeWidth = 2..color = Colors.limeAccent);
+      canvas.drawCircle(center, radius * 0.9, Paint()..style = PaintingStyle.stroke..strokeWidth = 2..color = Colors.orangeAccent);
+    }
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
 
 // -------------------- ISOLATE / Payload / Analyzer --------------------
