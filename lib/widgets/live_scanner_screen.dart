@@ -1,4 +1,4 @@
-// lib/widgets/live_scanner_screen.dart
+// lib/widgets/live_scanner_screen_v2.dart
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
@@ -35,15 +35,6 @@ class LiveScannerScreen extends StatefulWidget {
 }
 
 class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindingObserver {
-  // DEBUG overlay vars (always active)
-  double? _debugRInner;
-  double? _debugROuter;
-  int? _debugCenterX;
-  int? _debugCenterY;
-  int? _debugImageW;
-  int? _debugImageH;
-  bool _debugAlwaysOn = true;
-  
   CameraController? _controller;
   CameraDescription? _camera;
   bool _isProcessing = false;
@@ -54,6 +45,15 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
   int _consecutiveDetections = 0;
   double _lastConfidence = 0.0;
   double _progress = 0.0;
+
+  // DEBUG overlay vars (always active)
+  double? _debugRInner;
+  double? _debugROuter;
+  int? _debugCenterX;
+  int? _debugCenterY;
+  int? _debugImageW;
+  int? _debugImageH;
+  bool _debugAlwaysOn = true;
 
   @override
   void initState() {
@@ -107,25 +107,27 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
     _throttleTimer = Timer(Duration(milliseconds: widget.throttleMs), () {});
     _isProcessing = true;
 
-    // Create payload for isolate
     final payload = _CameraFramePayload.fromCameraImage(image, _controller!.description.sensorOrientation);
     compute<_CameraFramePayload, _ScanCandidate>(_analyzeFrameIsolate, payload).then((candidate) async {
       _isProcessing = false;
       if (!mounted || !_scanningActive) return;
 
-      if (candidate != null && candidate.confidence > 0.45) {
+      // stricter acceptance threshold for candidate previews
+      if (candidate != null && candidate.confidence > 0.85) {
         _lastConfidence = candidate.confidence;
         _consecutiveDetections++;
+        _progress = min(1.0, _consecutiveDetections / widget.requiredDetections);
+
         // store detected center for overlay
         try {
           _debugCenterX = candidate.centerX;
           _debugCenterY = candidate.centerY;
         } catch (e) {}
-        _progress = min(1.0, _consecutiveDetections / widget.requiredDetections);
+
         setState(() {});
 
         if (_consecutiveDetections >= widget.requiredDetections && widget.autoCapture) {
-          // Try fast preview decode if thumbnail available
+          // Try fast preview decode if thumbnail available (but only accept if plausible)
           bool usedPreview = false;
           if (candidate.thumbnail != null) {
             try {
@@ -153,9 +155,9 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
                 final onesProd = bitsProducto.where((b) => b==1).length;
                 final onesDate = bitsFecha.where((b) => b==1).length;
 
-                // simple plausibility checks: not all ones/zeros and some ones
-                if (onesProd > 0 && onesProd < bitsProducto.length && onesDate >= 0 && onesDate <= bitsFecha.length) {
-                  // accept preview result
+                // plausibility: not all ones/zeros, have some variability and not obviously random
+                if (onesProd > 0 && onesProd < bitsProducto.length && bitsProducto.length == 9) {
+                  // ensure preview bits aren't trivially all equal
                   widget.onResult(productBits: bitsProducto, dateBits: bitsFecha, imageBytes: candidate.thumbnail!);
                   usedPreview = true;
                 }
@@ -166,8 +168,9 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
           }
 
           if (!usedPreview) {
+            // only allow high-res capture if radii are known or confidence extreme
             if ((_debugRInner != null && _debugROuter != null) || _lastConfidence > 0.95) {
-              _performHighResCapture();
+              await _performHighResCapture();
             } else {
               debugPrint('Capture postponed: radii not set or confidence insufficient');
             }
@@ -192,11 +195,11 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
       final XFile file = await _controller!.takePicture();
       final bytes = await file.readAsBytes();
 
-      // decode full-res and run your existing Dart decoder
+      // decode full-res and run Dart decoder
       final decoded = img.decodeImage(bytes);
       if (decoded == null) throw Exception('No se pudo decodificar la imagen capturada.');
 
-      // auto-calculate radial params for accurate sampling (v2)
+      // Auto-calculate radial params on the captured image
       try {
         final params = autoCalcularRadios(decoded, decoded.width ~/ 2, decoded.height ~/ 2, steps: 180);
         _debugRInner = params.rInner;
@@ -208,23 +211,22 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
         debugPrint('autoCalcularRadios failed: $e');
       }
 
+      final decoder = CircularCodeDecoder(decoded);
 
-      final rExt1 = _debugRInner ?? (scale * 0.55);
-      final rExt2 = _debugROuter ?? (scale * 0.85);
-      final desplRel = 0.65; // o params.relPos if you saved it
+      final rExt1 = _debugRInner ?? (min(decoded.width, decoded.height) / 2 * 0.55);
+      final rExt2 = _debugROuter ?? (min(decoded.width, decoded.height) / 2 * 0.85);
+      final desplRel = 0.65;
 
-      final inicioProducto = decoder.detectarInicio(r1: rExt1, r2: rExt2, desplazamientoRelativo: desplRel);
+      final inicioProducto = decoder.detectarInicio(r1: rExt1, r2: rExt2, desplazamientoRelativo: 0.2);
 
-      // For inner ring use proportional inner radii relative to detected outer ring
-      // We'll estimate inner ring by scaling inward (~0.45 of outer radius)
-      final centerScale = min(decoded.width, decoded.height)/2;
-      final rInt2 = rExt1 * 0.9; // estimate inner outer boundary relative to outer ring
-      final rInt1 = rInt2 * 0.45; // estimate inner inner boundary
+      // Estimate inner ring radii relative to outer ring (empirical)
+      final rInt2 = rExt1 * 0.9;
+      final rInt1 = rInt2 * 0.45;
 
       final inicioFecha = decoder.detectarInicio(r1: rInt1, r2: rInt2, desplazamientoRelativo: 0.5);
 
       final bitsProducto = decoder.bitsDesdeIndice(
-        decoder.extractBits(r1: rExt1, r2: rExt2, colorType: 'negro', desplazamientoRelativo: desplRel),
+        decoder.extractBits(r1: rExt1, r2: rExt2, colorType: 'negro', desplazamientoRelativo: 0.2),
         inicioProducto,
       );
 
@@ -232,6 +234,12 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
         decoder.extractBits(r1: rInt1, r2: rInt2, colorType: 'amarillo', desplazamientoRelativo: 0.5),
         inicioFecha,
       );
+
+      // basic plausibility: product bits not all same
+      final onesProd = bitsProducto.where((b) => b==1).length;
+      if (!(onesProd > 0 && onesProd < bitsProducto.length)) {
+        throw Exception('Decoded product bits failed plausibility check');
+      }
 
       // return result
       widget.onResult(productBits: bitsProducto, dateBits: bitsFecha, imageBytes: bytes);
@@ -348,7 +356,9 @@ class _OverlayPainter extends CustomPainter {
       ..color = Colors.white38;
     canvas.drawCircle(center, radius - 4, paint);
 
-    final markPaint = Paint()..color = Colors.white70..strokeWidth = 1.4;
+    final markPaint = Paint()
+      ..color = Colors.white70
+      ..strokeWidth = 1.4;
     for (int i = 0; i < 16; i++) {
       final ang = 2 * pi * i / 16;
       final p1 = center + Offset(cos(ang), sin(ang)) * (radius - 6);
@@ -375,7 +385,6 @@ class _OverlayPainter extends CustomPainter {
       canvas.drawCircle(center, innerR, circlePaint..color = Colors.limeAccent);
       canvas.drawCircle(center, outerR, circlePaint..color = Colors.orangeAccent);
     } else if (debugRInner != null && debugROuter != null) {
-      // fallback approximate
       canvas.drawCircle(center, radius * 0.6, Paint()..style = PaintingStyle.stroke..strokeWidth = 2..color = Colors.limeAccent);
       canvas.drawCircle(center, radius * 0.9, Paint()..style = PaintingStyle.stroke..strokeWidth = 2..color = Colors.orangeAccent);
     }
@@ -421,7 +430,7 @@ class _ScanCandidate {
   _ScanCandidate({required this.confidence, required this.centerX, required this.centerY, this.thumbnail});
 }
 
-/// Runs in an isolate/// Runs in an isolate: converts YUV -> RGB (fast), then does radial edge detection
+/// Runs in an isolate: converts YUV -> RGB (fast), then does radial edge detection
 Future<_ScanCandidate> _analyzeFrameIsolate(_CameraFramePayload payload) async {
   try {
     final width = payload.width;
@@ -437,13 +446,11 @@ Future<_ScanCandidate> _analyzeFrameIsolate(_CameraFramePayload payload) async {
     final imgSmall = img.Image(width: smallW, height: smallH);
 
     // fast approx YUV420->RGB on downscaled grid
-    // note: plane strides vary across devices; we assume common layout
     int yp = 0;
     for (int j = 0; j < smallH; j++) {
       final srcJ = (j * downscale).round();
       for (int i = 0; i < smallW; i++) {
         final srcI = (i * downscale).round();
-        // map to original index
         final yIndex = srcJ * width + srcI;
         final yVal = (y.length > yIndex) ? (y[yIndex] & 0xff) : 0;
         final uvIndex = ((srcJ ~/ 2) * (width ~/ 2) + (srcI ~/ 2));
@@ -501,7 +508,6 @@ Future<_ScanCandidate> _analyzeFrameIsolate(_CameraFramePayload payload) async {
 
     final confidence = edgePoints.length / steps;
 
-    
     // encode thumbnail (jpeg) from imgSmall for quick preview decode
     Uint8List? thumbBytes;
     try {
