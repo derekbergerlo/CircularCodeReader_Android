@@ -1,7 +1,8 @@
-// lib/widgets/live_scanner_screen_v2.dart
+// lib/widgets/live_scanner_screen.dart
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -26,8 +27,8 @@ class LiveScannerScreen extends StatefulWidget {
     Key? key,
     required this.onResult,
     this.autoCapture = true,
-    this.throttleMs = 200,
-    this.requiredDetections = 3,
+    this.throttleMs = 180,
+    this.requiredDetections = 2,
   }) : super(key: key);
 
   @override
@@ -41,12 +42,13 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
   bool _scanningActive = true;
   Timer? _throttleTimer;
 
-  // stabilization
+  // stabilization & adaptive thresholding
   int _consecutiveDetections = 0;
   double _lastConfidence = 0.0;
   double _progress = 0.0;
+  double _confidenceEMA = 0.0; // exponential moving average of confidence
 
-  // DEBUG overlay vars (always active)
+  // DEBUG overlay vars (always active for now)
   double? _debugRInner;
   double? _debugROuter;
   int? _debugCenterX;
@@ -54,6 +56,11 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
   int? _debugImageW;
   int? _debugImageH;
   bool _debugAlwaysOn = true;
+
+  // UI: overlay placement adjustments
+  Size? _previewSize; // logical preview size (controller.value.previewSize)
+  // overlay configuration
+  final double _overlayDiameter = 320.0;
 
   @override
   void initState() {
@@ -74,8 +81,15 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
     try {
       final cameras = await availableCameras();
       _camera = cameras.firstWhere((c) => c.lensDirection == CameraLensDirection.back, orElse: () => cameras.first);
-      _controller = CameraController(_camera!, ResolutionPreset.medium, enableAudio: false);
+      _controller = CameraController(_camera!, ResolutionPreset.medium, enableAudio: false, imageFormatGroup: ImageFormatGroup.yuv420);
       await _controller!.initialize();
+
+      // store preview size for overlay mapping
+      final psize = _controller!.value.previewSize;
+      if (psize != null) {
+        // flip width/height if necessary based on orientation
+        _previewSize = Size(psize.height, psize.width); // camera previewSize is often rotated
+      }
 
       // start stream
       await _controller!.startImageStream(_onCameraImage);
@@ -99,6 +113,21 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
     _controller = null;
   }
 
+  // adaptive confidence threshold (mixture strategy):
+  // base 0.65..0.85 depending on recent EMA: if EMA high, allow lower immediate threshold
+  double _adaptiveConfidenceThreshold() {
+    // EMA in [0..1], if EMA>0.7 we can lower threshold slightly
+    final ema = _confidenceEMA.clamp(0.0, 1.0);
+    final base = 0.75; // default mid
+    final adjust = (ema - 0.6) * 0.25; // small adaptive tweak
+    return (base - adjust).clamp(0.60, 0.85);
+  }
+
+  void _updateConfidenceEMA(double c) {
+    const alpha = 0.25;
+    _confidenceEMA = alpha * c + (1 - alpha) * _confidenceEMA;
+  }
+
   void _onCameraImage(CameraImage image) {
     if (!_scanningActive) return;
     if (_isProcessing) return;
@@ -112,22 +141,28 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
       _isProcessing = false;
       if (!mounted || !_scanningActive) return;
 
-      // stricter acceptance threshold for candidate previews
-      if (candidate != null && candidate.confidence > 0.85) {
+      // update center immediately so overlay shows movement
+      if (candidate != null) {
+        _debugCenterX = candidate.centerX;
+        _debugCenterY = candidate.centerY;
+      }
+
+      // update EMA regardless
+      if (candidate != null) {
+        _updateConfidenceEMA(candidate.confidence);
         _lastConfidence = candidate.confidence;
+      }
+
+      final threshold = _adaptiveConfidenceThreshold();
+
+      // acceptance for "candidate" to increment detection
+      if (candidate != null && candidate.confidence > threshold) {
         _consecutiveDetections++;
         _progress = min(1.0, _consecutiveDetections / widget.requiredDetections);
-
-        // store detected center for overlay
-        try {
-          _debugCenterX = candidate.centerX;
-          _debugCenterY = candidate.centerY;
-        } catch (e) {}
-
         setState(() {});
 
         if (_consecutiveDetections >= widget.requiredDetections && widget.autoCapture) {
-          // Try fast preview decode if thumbnail available (but only accept if plausible)
+          // Try fast preview decode if thumbnail available (plausibility checks)
           bool usedPreview = false;
           if (candidate.thumbnail != null) {
             try {
@@ -152,12 +187,10 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
                   inicioFecha,
                 );
 
-                final onesProd = bitsProducto.where((b) => b==1).length;
-                final onesDate = bitsFecha.where((b) => b==1).length;
+                final onesProd = bitsProducto.where((b) => b == 1).length;
 
-                // plausibility: not all ones/zeros, have some variability and not obviously random
-                if (onesProd > 0 && onesProd < bitsProducto.length && bitsProducto.length == 9) {
-                  // ensure preview bits aren't trivially all equal
+                // preview plausibility: not trivial and has some ones
+                if (bitsProducto.length == 9 && onesProd > 0 && onesProd < bitsProducto.length) {
                   widget.onResult(productBits: bitsProducto, dateBits: bitsFecha, imageBytes: candidate.thumbnail!);
                   usedPreview = true;
                 }
@@ -168,16 +201,35 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
           }
 
           if (!usedPreview) {
-            // only allow high-res capture if radii are known or confidence extreme
-            if ((_debugRInner != null && _debugROuter != null) || _lastConfidence > 0.95) {
+            // allow high-res capture if we already estimated radii or candidate is very confident
+            final highConfidenceCut = 0.95;
+            if ((_debugRInner != null && _debugROuter != null) || candidate.confidence > highConfidenceCut) {
               await _performHighResCapture();
             } else {
-              debugPrint('Capture postponed: radii not set or confidence insufficient');
+              // if no radii yet, try a lightweight radial pass in preview thumbnail (better UX)
+              if (candidate.thumbnail != null) {
+                try {
+                  final thumbImg = img.decodeImage(candidate.thumbnail!);
+                  if (thumbImg != null) {
+                    final thumbParams = autoCalcularRadios(thumbImg, thumbImg.width ~/ 2, thumbImg.height ~/ 2, steps: 80);
+                    // map thumb params to expected scale later; store as hints
+                    _debugRInner = thumbParams.rInner * (min(_debugImageW ?? thumbImg.width, _debugImageH ?? thumbImg.height) / max(1, thumbImg.width));
+                    _debugROuter = thumbParams.rOuter * (min(_debugImageW ?? thumbImg.width, _debugImageH ?? thumbImg.height) / max(1, thumbImg.width));
+                    // Still prefer high-res capture if plausible
+                    await _performHighResCapture();
+                  }
+                } catch (e) {
+                  debugPrint('Preview radial failed: $e');
+                  await _performHighResCapture();
+                }
+              } else {
+                await _performHighResCapture();
+              }
             }
           }
         }
       } else {
-        // decay
+        // decay detections gracefully
         if (_consecutiveDetections > 0) _consecutiveDetections = max(0, _consecutiveDetections - 1);
         _progress = (_consecutiveDetections / widget.requiredDetections).clamp(0.0, 1.0);
         setState(() {});
@@ -188,6 +240,7 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
     });
   }
 
+  /// High-res capture flow. After capture it decodes with auto-radial and draws sampling debug overlay on the captured image.
   Future<void> _performHighResCapture() async {
     if (_controller == null) return;
     _scanningActive = false;
@@ -238,11 +291,20 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
       // basic plausibility: product bits not all same
       final onesProd = bitsProducto.where((b) => b==1).length;
       if (!(onesProd > 0 && onesProd < bitsProducto.length)) {
-        throw Exception('Decoded product bits failed plausibility check');
+        debugPrint('Plausibility failed on high-res decode, returning to scanning');
+        // resume scanning gracefully
+        _scanningActive = true;
+        _consecutiveDetections = 0;
+        _progress = 0.0;
+        setState(() {});
+        return;
       }
 
-      // return result
-      widget.onResult(productBits: bitsProducto, dateBits: bitsFecha, imageBytes: bytes);
+      // Create debug overlay image with sampling points and circles
+      final debugImageBytes = _drawSamplingOverlay(decoded, rExt1, rExt2, rInt1, rInt2, inicioProducto, inicioFecha, bitsProducto, bitsFecha);
+
+      // Return result with debug image (if you prefer the raw photo bytes, change to 'bytes')
+      widget.onResult(productBits: bitsProducto, dateBits: bitsFecha, imageBytes: debugImageBytes);
 
       // pop screen
       if (mounted) Navigator.of(context).pop();
@@ -256,18 +318,145 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
     }
   }
 
+  /// Draw sampling points and circles onto a copy of the captured image and return JPEG bytes
+  Uint8List _drawSamplingOverlay(
+    img.Image source,
+    double extR1,
+    double extR2,
+    double intR1,
+    double intR2,
+    int startExt,
+    int startInt,
+    List<int> bitsExt,
+    List<int> bitsInt,
+  ) {
+    // work on a copy
+    final out = img.copyResize(source, width: source.width); // copy
+    final w = out.width;
+    final h = out.height;
+    final cx = w ~/ 2;
+    final cy = h ~/ 2;
+
+    // draw outer and inner ring boundaries
+    img.drawCircle(out, cx, cy, extR1.round(), img.getColor(0, 255, 0), thickness: 2); // inner boundary of outer ring
+    img.drawCircle(out, cx, cy, extR2.round(), img.getColor(255, 165, 0), thickness: 2); // outer boundary of outer ring
+    img.drawCircle(out, cx, cy, intR1.round(), img.getColor(0, 200, 200), thickness: 2);
+    img.drawCircle(out, cx, cy, intR2.round(), img.getColor(0, 200, 200), thickness: 2);
+
+    final numSectors = 10;
+    final desplazExt = 0.2;
+    final desplazInt = 0.5;
+
+    // draw sector sampling points for outer ring
+    for (int i = 0; i < numSectors; i++) {
+      final ang = 2 * pi * (i + 0.5) / numSectors;
+      final radius = extR1 + desplazExt * (extR2 - extR1);
+      final x = (cx + radius * cos(ang)).round();
+      final y = (cy + radius * sin(ang)).round();
+      final color = (bitsExt[i] == 1) ? img.getColor(255, 0, 0) : img.getColor(0, 0, 0);
+      img.fillCircle(out, x, y, 6, color);
+      // mark start sector with triangle-like mark (small line)
+      if (i == startExt) {
+        // draw small wedge marker
+        final x2 = (cx + (radius - 18) * cos(ang)).round();
+        final y2 = (cy + (radius - 18) * sin(ang)).round();
+        img.drawLine(out, x2, y2, x, y, img.getColor(255, 0, 255));
+      }
+    }
+
+    // draw sector sampling points for inner ring
+    for (int i = 0; i < numSectors; i++) {
+      final ang = 2 * pi * (i + 0.5) / numSectors;
+      final radius = intR1 + desplazInt * (intR2 - intR1);
+      final x = (cx + radius * cos(ang)).round();
+      final y = (cy + radius * sin(ang)).round();
+      final color = (bitsInt[i] == 1) ? img.getColor(255, 255, 0) : img.getColor(50, 50, 50);
+      img.fillCircle(out, x, y, 5, color);
+      if (i == startInt) {
+        final x2 = (cx + (radius - 12) * cos(ang)).round();
+        final y2 = (cy + (radius - 12) * sin(ang)).round();
+        img.drawLine(out, x2, y2, x, y, img.getColor(255, 0, 255));
+      }
+    }
+
+    // draw detected center
+    img.fillCircle(out, cx, cy, 6, img.getColor(255, 0, 0));
+
+    // draw text overlay with bits (top-left)
+    final prodText = 'P: ' + bitsExt.join();
+    final dateText = 'D: ' + bitsInt.join();
+    img.drawString(out, img.arial_14, 8, 8, prodText, color: img.getColor(255, 255, 255));
+    img.drawString(out, img.arial_14, 8, 26, dateText, color: img.getColor(255, 255, 255));
+
+    // encode to JPEG
+    final jpg = img.encodeJpg(out, quality: 85);
+    return Uint8List.fromList(jpg);
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_controller == null || !_controller!.value.isInitialized) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
+    // compute overlay translation so it aligns with the camera preview content
+    final previewSize = _previewSize ?? Size(MediaQuery.of(context).size.width, MediaQuery.of(context).size.height);
+    // CameraPreview is usually letterboxed; compute scale and translate to center the overlay onto the active preview area.
+    final screenW = MediaQuery.of(context).size.width;
+    final screenH = MediaQuery.of(context).size.height;
+    final previewAspect = previewSize.width / previewSize.height;
+    final screenAspect = screenW / screenH;
+
+    double scaleToFit;
+    double offsetX = 0.0;
+    double offsetY = 0.0;
+
+    if (previewAspect > screenAspect) {
+      // preview is wider -> fits screen width, black bars top/bottom
+      scaleToFit = screenW / previewSize.width;
+      final fittedHeight = previewSize.height * scaleToFit;
+      offsetY = (screenH - fittedHeight) / 2;
+    } else {
+      // preview is taller -> fits screen height, black bars left/right
+      scaleToFit = screenH / previewSize.height;
+      final fittedWidth = previewSize.width * scaleToFit;
+      offsetX = (screenW - fittedWidth) / 2;
+    }
+
+    // overlay center in screen coordinates
+    final overlayLeft = ((screenW - _overlayDiameter) / 2) + offsetX;
+    final overlayTop = ((screenH - _overlayDiameter) / 2) + offsetY;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Escanear (Profesional)')),
+      appBar: AppBar(title: const Text('Escanear (Profesional — v3)')),
       body: Stack(
         children: [
           CameraPreview(_controller!),
-          Center(child: _buildOverlay()),
+          // Positioned overlay that maps to preview content area
+          Positioned(
+            left: overlayLeft,
+            top: overlayTop,
+            width: _overlayDiameter,
+            height: _overlayDiameter,
+            child: IgnorePointer(
+              child: Container(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.white70, width: 4),
+                ),
+                child: CustomPaint(
+                  painter: _OverlayPainter(
+                    debugCenterX: _debugCenterX,
+                    debugCenterY: _debugCenterY,
+                    debugRInner: _debugRInner,
+                    debugROuter: _debugROuter,
+                    debugImageW: _debugImageW,
+                    debugImageH: _debugImageH,
+                  ),
+                ),
+              ),
+            ),
+          ),
           Positioned(
             top: 16,
             left: 16,
@@ -299,29 +488,6 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
         child: Text(
           _scanningActive ? 'Escaneando...' : 'Procesando...',
           style: const TextStyle(color: Colors.white),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildOverlay() {
-    return IgnorePointer(
-      child: Container(
-        width: 320,
-        height: 320,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.white70, width: 4),
-        ),
-        child: CustomPaint(
-          painter: _OverlayPainter(
-            debugCenterX: _debugCenterX,
-            debugCenterY: _debugCenterY,
-            debugRInner: _debugRInner,
-            debugROuter: _debugROuter,
-            debugImageW: _debugImageW,
-            debugImageH: _debugImageH,
-          ),
         ),
       ),
     );
@@ -366,22 +532,31 @@ class _OverlayPainter extends CustomPainter {
       canvas.drawLine(p1, p2, markPaint);
     }
 
-    // debug center
-    if (debugCenterX != null && debugCenterY != null) {
+    // debug center: map debugCenterX/Y to preview overlay center coordinates roughly
+    if (debugCenterX != null && debugCenterY != null && debugImageW != null && debugImageH != null) {
+      // assume center of image corresponds to center of overlay and scale accordingly
+      final imgMin = min(debugImageW!.toDouble(), debugImageH!.toDouble());
+      final scaleFactor = (radius) / (imgMin / 2.0);
+      final dx = (debugCenterX! - (debugImageW! / 2)) * scaleFactor;
+      final dy = (debugCenterY! - (debugImageH! / 2)) * scaleFactor;
+      final dotPos = center + Offset(dx, dy);
+      final dotPaint = Paint()..color = Colors.redAccent..style = PaintingStyle.fill;
+      canvas.drawCircle(dotPos, 5, dotPaint);
+    } else if (debugCenterX != null && debugCenterY != null) {
+      // fallback: place dot at center (we still mark something)
       final dotPaint = Paint()..color = Colors.redAccent..style = PaintingStyle.fill;
       canvas.drawCircle(center, 4, dotPaint);
     }
 
-    // draw debug radii if available and map image pixels to preview overlay
+    // draw debug radii mapped to overlay (if we have image dims)
     if (debugRInner != null && debugROuter != null && debugImageW != null && debugImageH != null) {
       final circlePaint = Paint()..style = PaintingStyle.stroke..strokeWidth = 2;
       final imgMin = min(debugImageW!.toDouble(), debugImageH!.toDouble());
-      final previewRadius = min(size.width, size.height) / 2.0;
+      final previewRadius = radius;
       final imgRadius = imgMin / 2.0;
-      final scaleFactor = previewRadius / imgRadius;
-      final innerR = (debugRInner! * scaleFactor).clamp(2.0, previewRadius);
-      final outerR = (debugROuter! * scaleFactor).clamp(2.0, previewRadius);
-
+      final scaleF = previewRadius / imgRadius;
+      final innerR = (debugRInner! * scaleF).clamp(2.0, previewRadius);
+      final outerR = (debugROuter! * scaleF).clamp(2.0, previewRadius);
       canvas.drawCircle(center, innerR, circlePaint..color = Colors.limeAccent);
       canvas.drawCircle(center, outerR, circlePaint..color = Colors.orangeAccent);
     } else if (debugRInner != null && debugROuter != null) {
