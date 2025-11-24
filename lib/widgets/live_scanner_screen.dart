@@ -9,7 +9,7 @@ import 'package:image/image.dart' as img;
 
 import '../decoder/bit_ring_decoder.dart';
 import '../decoder/auto_radial.dart';
-z
+
 typedef OnScanResult = void Function({
   required List<int> productBits,
   required List<int> dateBits,
