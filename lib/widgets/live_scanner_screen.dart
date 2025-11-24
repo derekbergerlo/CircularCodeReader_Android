@@ -1,4 +1,5 @@
-// lib/widgets/live_scanner_screen.dart
+// lib/widgets/live_scanner_screen.dart (migrated for image ^4.1.3)
+// Version: v3 migrated - overlay drawing uses image 4.x compatible API
 import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
@@ -116,7 +117,6 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
   // adaptive confidence threshold (mixture strategy):
   // base 0.65..0.85 depending on recent EMA: if EMA high, allow lower immediate threshold
   double _adaptiveConfidenceThreshold() {
-    // EMA in [0..1], if EMA>0.7 we can lower threshold slightly
     final ema = _confidenceEMA.clamp(0.0, 1.0);
     final base = 0.75; // default mid
     final adjust = (ema - 0.6) * 0.25; // small adaptive tweak
@@ -212,9 +212,9 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
                   final thumbImg = img.decodeImage(candidate.thumbnail!);
                   if (thumbImg != null) {
                     final thumbParams = autoCalcularRadios(thumbImg, thumbImg.width ~/ 2, thumbImg.height ~/ 2, steps: 80);
-                    // map thumb params to expected scale later; store as hints
-                    _debugRInner = thumbParams.rInner * (min(_debugImageW ?? thumbImg.width, _debugImageH ?? thumbImg.height) / max(1, thumbImg.width));
-                    _debugROuter = thumbParams.rOuter * (min(_debugImageW ?? thumbImg.width, _debugImageH ?? thumbImg.height) / max(1, thumbImg.width));
+                    // store as hints (mapped later to full-res when available)
+                    _debugRInner = thumbParams.rInner;
+                    _debugROuter = thumbParams.rOuter;
                     // Still prefer high-res capture if plausible
                     await _performHighResCapture();
                   }
@@ -337,11 +337,16 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
     final cx = w ~/ 2;
     final cy = h ~/ 2;
 
-    // draw outer and inner ring boundaries
-    img.drawCircle(out, cx, cy, extR1.round(), img.getColor(0, 255, 0), thickness: 2); // inner boundary of outer ring
-    img.drawCircle(out, cx, cy, extR2.round(), img.getColor(255, 165, 0), thickness: 2); // outer boundary of outer ring
-    img.drawCircle(out, cx, cy, intR1.round(), img.getColor(0, 200, 200), thickness: 2);
-    img.drawCircle(out, cx, cy, intR2.round(), img.getColor(0, 200, 200), thickness: 2);
+    // helper to build color int (ARGB)
+    int colorInt(int r, int g, int b, [int a = 255]) {
+      return ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+    }
+
+    // draw outer and inner ring boundaries (outline)
+    img.drawCircle(out, x: cx, y: cy, radius: extR1.round(), color: colorInt(0, 255, 0));
+    img.drawCircle(out, x: cx, y: cy, radius: extR2.round(), color: colorInt(255, 165, 0));
+    img.drawCircle(out, x: cx, y: cy, radius: intR1.round(), color: colorInt(0, 200, 200));
+    img.drawCircle(out, x: cx, y: cy, radius: intR2.round(), color: colorInt(0, 200, 200));
 
     final numSectors = 10;
     final desplazExt = 0.2;
@@ -353,14 +358,13 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
       final radius = extR1 + desplazExt * (extR2 - extR1);
       final x = (cx + radius * cos(ang)).round();
       final y = (cy + radius * sin(ang)).round();
-      final color = (bitsExt[i] == 1) ? img.getColor(255, 0, 0) : img.getColor(0, 0, 0);
-      img.fillCircle(out, x, y, 6, color);
-      // mark start sector with triangle-like mark (small line)
+      final color = bitsExt[i] == 1 ? colorInt(255, 0, 0) : colorInt(0, 0, 0);
+      img.fillCircle(out, x: x, y: y, radius: 6, color: color);
+      // mark start sector with small wedge marker (line)
       if (i == startExt) {
-        // draw small wedge marker
         final x2 = (cx + (radius - 18) * cos(ang)).round();
         final y2 = (cy + (radius - 18) * sin(ang)).round();
-        img.drawLine(out, x2, y2, x, y, img.getColor(255, 0, 255));
+        img.drawLine(out, x1: x2, y1: y2, x2: x, y2: y, color: colorInt(255, 0, 255));
       }
     }
 
@@ -370,23 +374,23 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
       final radius = intR1 + desplazInt * (intR2 - intR1);
       final x = (cx + radius * cos(ang)).round();
       final y = (cy + radius * sin(ang)).round();
-      final color = (bitsInt[i] == 1) ? img.getColor(255, 255, 0) : img.getColor(50, 50, 50);
-      img.fillCircle(out, x, y, 5, color);
+      final color = bitsInt[i] == 1 ? colorInt(255, 255, 0) : colorInt(50, 50, 50);
+      img.fillCircle(out, x: x, y: y, radius: 5, color: color);
       if (i == startInt) {
         final x2 = (cx + (radius - 12) * cos(ang)).round();
         final y2 = (cy + (radius - 12) * sin(ang)).round();
-        img.drawLine(out, x2, y2, x, y, img.getColor(255, 0, 255));
+        img.drawLine(out, x1: x2, y1: y2, x2: x, y2: y, color: colorInt(255, 0, 255));
       }
     }
 
-    // draw detected center
-    img.fillCircle(out, cx, cy, 6, img.getColor(255, 0, 0));
+    // draw detected center (small filled circle)
+    img.fillCircle(out, x: cx, y: cy, radius: 6, color: colorInt(255, 0, 0));
 
-    // draw text overlay with bits (top-left)
+    // draw text overlay with bits (top-left) - using simple drawString signature (image, string, x, y)
     final prodText = 'P: ' + bitsExt.join();
     final dateText = 'D: ' + bitsInt.join();
-    img.drawString(out, img.arial_14, 8, 8, prodText, color: img.getColor(255, 255, 255));
-    img.drawString(out, img.arial_14, 8, 26, dateText, color: img.getColor(255, 255, 255));
+    img.drawString(out, prodText, 8, 8);
+    img.drawString(out, dateText, 8, 26);
 
     // encode to JPEG
     final jpg = img.encodeJpg(out, quality: 85);
@@ -428,7 +432,7 @@ class _LiveScannerScreenState extends State<LiveScannerScreen> with WidgetsBindi
     final overlayTop = ((screenH - _overlayDiameter) / 2) + offsetY;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Escanear (Profesional — v3)')),
+      appBar: AppBar(title: const Text('Escanear (Profesional — v3 migrated)')),
       body: Stack(
         children: [
           CameraPreview(_controller!),
